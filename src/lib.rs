@@ -1,8 +1,7 @@
 mod steam_keys;
 use steam_keys::KEYS;
 
-mod wayland;
-use wayland::get_axes_range;
+mod x11;
 
 use evdev::{
     uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode,
@@ -19,17 +18,20 @@ pub struct Display {
     _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,
 }
 
-struct FakeDevice {
-    dev: VirtualDevice,
-    // False when the display size could not be read, so absolute motion is unsupported.
-    has_abs: bool,
+// Absolute positions are sent as a fraction of the X screen in this range, and the
+// compositor maps the range onto its whole layout. A fixed range lets the screen
+// size change without recreating the device.
+const ABS_RANGE: i32 = 1 << 16;
+
+/// Maps an X screen coordinate onto 0..ABS_RANGE, clamping positions off the screen.
+fn scale_to_axis(coord: c_int, size: u32) -> i32 {
+    let scaled = i64::from(coord) * i64::from(ABS_RANGE) / i64::from(size.max(1));
+    scaled.clamp(0, i64::from(ABS_RANGE - 1)) as i32
 }
 
-fn build_device() -> std::io::Result<FakeDevice> {
-    let size = get_axes_range()
-        .map_err(|e| eprintln!("extest: absolute pointer motion disabled: {e}"))
-        .ok();
-    let mut builder = VirtualDevice::builder()?
+fn build_device() -> std::io::Result<VirtualDevice> {
+    let abs = AbsInfo::new(0, 0, ABS_RANGE - 1, 0, 0, 1);
+    VirtualDevice::builder()?
         .name("extest fake device")
         .with_keys(&AttributeSet::from_iter(
             [
@@ -46,25 +48,13 @@ fn build_device() -> std::io::Result<FakeDevice> {
             RelativeAxisCode::REL_X,
             RelativeAxisCode::REL_Y,
             RelativeAxisCode::REL_WHEEL,
-        ]))?;
-    if let Some(size) = size {
-        builder = builder
-            .with_absolute_axis(&UinputAbsSetup::new(
-                AbsoluteAxisCode::ABS_X,
-                AbsInfo::new(0, 0, size.width, 0, 0, 1),
-            ))?
-            .with_absolute_axis(&UinputAbsSetup::new(
-                AbsoluteAxisCode::ABS_Y,
-                AbsInfo::new(0, 0, size.height, 0, 0, 1),
-            ))?;
-    }
-    Ok(FakeDevice {
-        dev: builder.build()?,
-        has_abs: size.is_some(),
-    })
+        ]))?
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisCode::ABS_X, abs))?
+        .with_absolute_axis(&UinputAbsSetup::new(AbsoluteAxisCode::ABS_Y, abs))?
+        .build()
 }
 
-static DEVICE: Lazy<Option<Mutex<FakeDevice>>> = Lazy::new(|| match build_device() {
+static DEVICE: Lazy<Option<Mutex<VirtualDevice>>> = Lazy::new(|| match build_device() {
     Ok(dev) => Some(Mutex::new(dev)),
     Err(e) => {
         eprintln!("extest: could not create the virtual input device, fake input is disabled: {e}");
@@ -91,7 +81,7 @@ fn with_device<T>(
 }
 
 fn emit(events: &[InputEvent]) -> c_int {
-    with_device(DEVICE.as_ref(), |d| d.dev.emit(events))
+    with_device(DEVICE.as_ref(), |d| d.emit(events))
 }
 
 /// X11 keycodes are the Linux keycode plus 8 - https://wiki.archlinux.org/title/Keyboard_input#Identifying_keycodes
@@ -217,23 +207,28 @@ pub extern "C" fn XTestFakeRelativeMotionEvent(
 
 #[no_mangle]
 pub extern "C" fn XTestFakeMotionEvent(
-    _: *mut Display,
-    _: c_int,
+    display: *mut Display,
+    screen: c_int,
     x: c_int,
     y: c_int,
     _: c_ulong,
 ) -> c_int {
-    let events = [
-        InputEvent::new_now(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, x),
-        InputEvent::new_now(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, y),
-    ];
-    with_device(DEVICE.as_ref(), |d| {
-        if d.has_abs {
-            d.dev.emit(&events)
-        } else {
-            Err(std::io::Error::other("absolute motion is unsupported"))
-        }
-    })
+    let Some((width, height)) = x11::screen_size(display, screen) else {
+        eprintln!("extest: ignoring absolute motion, the X screen size is unknown");
+        return 0;
+    };
+    emit(&[
+        InputEvent::new_now(
+            EventType::ABSOLUTE.0,
+            AbsoluteAxisCode::ABS_X.0,
+            scale_to_axis(x, width),
+        ),
+        InputEvent::new_now(
+            EventType::ABSOLUTE.0,
+            AbsoluteAxisCode::ABS_Y.0,
+            scale_to_axis(y, height),
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -249,6 +244,18 @@ mod tests {
         assert_eq!(x11_keycode_to_key(u32::MAX), None);
         assert_eq!(x11_keycode_to_key(9), Some(KeyCode::KEY_ESC));
         assert_eq!(x11_keycode_to_key(156), Some(KeyCode::KEY_TAB));
+    }
+
+    #[test]
+    fn absolute_motion_is_relative_to_the_x_screen() {
+        // A 2560x1440 X screen on a 1.25 scaled output: the center must map to the
+        // center of the axis, not to 1280/2048 of the logical Wayland size.
+        assert_eq!(scale_to_axis(1280, 2560), ABS_RANGE / 2);
+        assert_eq!(scale_to_axis(720, 1440), ABS_RANGE / 2);
+        assert_eq!(scale_to_axis(0, 2560), 0);
+        assert_eq!(scale_to_axis(2559, 2560), ABS_RANGE - 26);
+        assert_eq!(scale_to_axis(-5, 2560), 0);
+        assert_eq!(scale_to_axis(9000, 2560), ABS_RANGE - 1);
     }
 
     #[test]
